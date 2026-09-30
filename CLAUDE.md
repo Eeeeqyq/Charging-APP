@@ -2,134 +2,72 @@
 
 ## What this is
 
-`Battery.py` shows a Mac's charging info: the charger's wattage rating, the power the Mac is drawing from the charger, and the total power the Mac is using. Right now it prints one line to the terminal, overwriting it every second.
+`Battery.py` is a small native macOS window (PyObjC/AppKit, one file) showing the power the Mac takes from its charger, what the battery is doing, and the total system load, updating every second. macOS on Apple Silicon only. The old one-line terminal version is in git history (`b1a4ffe`).
 
-## Status
+## Rules
 
-A GUI window version is being designed; the open questions are in **GUI design (in progress)** at the end of this file. Update this file when the GUI lands.
+- **The user makes every commit.** Leave all changes in the working tree. Hard guardrail: no `git commit`, `git push` or index changes (`git add`, `git rm --cached`); when one is needed, give the user the command. Put this rule in every sub-agent's prompt, since sub-agents don't see it otherwise.
+- **Serial numbers stay private.** ioreg output includes battery and adapter serials (`Serial`, `BatteryData.Serial`, `AdapterDetails.SerialString`). Read fields by name and print only the fields you need. Keep serials out of output, logs, commits and fixtures; test data is made-up values, never a saved ioreg dump.
+- **The README keeps the author's note** that this is a personal-interest project made just to see some charging info, and that Claude did most of the work.
+- **The design is settled with the user.** Layout, wording, colors and behavior below (and the strings in `describe()`) were agreed field by field. Change them only when asked, and state any new default you pick so the user can overrule it.
 
 ## Run
 
 ```sh
-python3 Battery.py
+uv run Battery.py        # or: python3 Battery.py
 ```
 
-- Uses only the standard library and runs only on macOS. Stop it with Ctrl+C.
-- The line is overwritten with `\r`, so it only shows up properly in a real terminal (VS Code's integrated terminal works), not in VS Code's Output panel or through a pipe.
+- Dependencies live in the PEP 723 block at the top of `Battery.py`; uv builds and caches the environment. Nothing to install besides uv.
+- Without PyObjC, `Battery.py` relaunches itself through `uv run`, which is how `python3` and VS Code's ▶ (both Apple's Python 3.9 here) still work. So the whole file has to **parse on Python 3.9**: no `match`, no 3.10+ syntax. Check with `/usr/bin/python3 -c "compile(open('Battery.py').read(), 'Battery.py', 'exec')"`.
+- `requires-python = ">=3.14"` is deliberate. With conda base active, uv would otherwise pick Anaconda's 3.13, a non-framework build that shows up as "python" in the Dock and menu bar. Homebrew's 3.14 is a framework build, which lets the CFBundleName rename to "Charging" work.
+- Quit with ⌘Q, Dock icon → Quit, or Ctrl+C in the launching terminal. Closing the window keeps the app in the Dock, and the app lives as long as that terminal. A normal run prints nothing.
 
-## Data source
+## Design
 
-`Battery.py` runs `ioreg -rw0 -a -c AppleSmartBattery` and parses the output with `plistlib.loads(out)[0]`.
+- **Window.** A titled, closable, miniaturizable window 300 pt wide, not resizable. Transparent title bar with full-size content and no title text. Frosted `NSVisualEffectView`: material `menu`, behind-window blending, always active. It follows light/dark on its own. The height fits the content and animates on plug/unplug, keeping the top edge in place. Every launch opens centered and unpinned (`restorable` off).
+- **Pin.** A pin icon at the bottom right toggles `NSFloatingWindowLevel`, on the current Space only. The pinned state isn't saved.
+- **Content.** The headline is power in ("62.4 W", "of 94 W charger", plus a bar showing the share of the charger's rating in use). On battery it's the power drawn from the battery ("from battery"), and the bar, "Into battery" and "System load" rows are hidden. Below that: the status line (colored dot, and a second quieter line when it doesn't fit), then rows for Battery %, Into battery and System load. The footer "Updated N s ago" appears only on the ioreg fallback. Watts have one decimal, the charger rating is a whole number, times read "1 h 12 min", digits are monospaced.
+- **Status** comes from ioreg flags, except that "plugged in" is decided live from `PDTR > 0.5 W`, so unplugging shows within a second. States: charging (green), on hold with a reason (orange), on battery (gray), fully charged (green), charger too weak (orange), a gray "Plugged in" for the moment before ioreg catches up with a plug, and a centered message when there's no battery or the data can't be read.
+- **Refresh.** An `NSTimer` ticks every 1 s in common modes. SMC every tick; ioreg every 5 s and right after a plug change; `pmset -g battlimit` at most once a minute while on hold. All reading stops while the window is closed, minimized, hidden or fully covered.
+- **Out of scope** (by agreement): alerts, charging controls, battery health, a Dock badge, a `.app` bundle.
 
-- Always pass `-a` (XML plist output). Negative numbers come through correctly there, while ioreg's text output shows them as huge unsigned numbers.
-- Empty output means there's no battery, as on desktop Macs. Check for it before parsing: `plistlib.loads(b"")` raises `plistlib.InvalidFileException`, which `Battery.py` doesn't handle yet.
-- `PowerTelemetryData` only exists on Apple Silicon Macs.
+## Data sources
 
-## Field reference
+**ioreg** (`ioreg -rw0 -a -c AppleSmartBattery`, parsed with `plistlib.loads(out)[0]`, about 17 ms per call):
+- Pass `-a`: the XML plist keeps negative numbers, while the text output shows them as huge unsigned ones.
+- Empty output means no battery (desktop Macs). `PowerTelemetryData` only exists on Apple Silicon.
+- The values refresh only about every 60 s (compare `UpdateTime` with now).
 
-Verified on an M4 Pro MacBook Pro running macOS 26.
-
-| Field | Unit / type | Notes |
+| Field | Unit | Notes |
 |---|---|---|
-| `CurrentCapacity`, `MaxCapacity` | % | Battery % matching the menu bar. `MaxCapacity` is always 100 on Apple Silicon. |
-| `AppleRawCurrentCapacity`, `AppleRawMaxCapacity`, `DesignCapacity`, `NominalChargeCapacity` | mAh | The raw current/max ratio doesn't equal the displayed % (e.g. 76% vs 80%). |
-| `Voltage` | mV | |
-| `Amperage`, `InstantAmperage` | mA, signed | Negative = discharging. |
-| `Temperature` | 0.01 °C | 3028 = 30.28 °C. |
-| `IsCharging`, `ExternalConnected`, `FullyCharged` | bool | Plugged in (`ExternalConnected`) doesn't mean charging. |
-| `TimeRemaining`, `AvgTimeToFull`, `AvgTimeToEmpty` | minutes | 65535 = not available. |
-| `CycleCount`, `DesignCycleCount9C` | cycles | `DesignCycleCount9C` is the rated cycle count (1000). |
-| `AdapterDetails.Watts` | W | Negotiated figure: a "96W" adapter reports 94. Missing when unplugged. |
-| `AdapterDetails.Name`, `AdapterDetails.Description` | text | `AdapterDetails` also holds the adapter's serial number (`SerialString`): never print or log it. |
-| `PowerTelemetryData.SystemPowerIn` | mW | Power coming from the adapter. |
-| `PowerTelemetryData.SystemLoad` | mW | What the Mac is using. |
-| `PowerTelemetryData.BatteryPower` | mW, signed | Power into or out of the battery; negative = discharging. |
-| `ChargerData.NotChargingReason` | int | Undocumented bitfield. |
-| `UpdateTime` | Unix time (s) | When macOS last refreshed these values. |
+| `CurrentCapacity` | % | Matches the menu bar. |
+| `IsCharging`, `ExternalConnected`, `FullyCharged` | bool | Plugged in doesn't mean charging: Optimized Battery Charging holds at ~80%. |
+| `TimeRemaining`, `AvgTimeToFull`, `AvgTimeToEmpty` | min | 65535 = no estimate. |
+| `AdapterDetails.Watts` | W | Negotiated: a "96W" adapter reports 94. Missing when unplugged. |
+| `PowerTelemetryData.SystemPowerIn`, `.SystemLoad` | mW | Equal to each other while the battery is idle. |
+| `PowerTelemetryData.BatteryPower` | mW, signed | Negative = discharging. |
+| `ChargerData.NotChargingReason` | bits | Bit 24 = held by the charge limit (same as SMC `CHNC` bit 24). |
+| `Voltage`, `InstantAmperage` | mV, mA signed | |
 
-## Gotchas
+**pmset.** `pmset -g battlimit` (undocumented) prints `chargeSocLimitReason = optimizedBatteryCharging;` and `chargeSocLimitSoc = 80;`. Any other reason string is shown as "Charge limit".
 
-- **Stale data.** macOS refreshes these values only about once every 60 s (observed on AC power). Polling faster, as `Battery.py`'s 1 s loop does, re-reads the same numbers; compare `UpdateTime` with the current time to know how old the data is.
-- **Plugged in isn't charging.** macOS Optimized Battery Charging can hold the battery at ~80% while `pmset -g batt` shows "AC attached; not charging". The code needs four states: charging, plugged in but not charging, on battery, and fully charged.
-- **Battery health.** Sources disagree: System Information's "Maximum Capacity", the mAh ratios, and IOPS (IOPowerSources) `BatteryHealth`. Pick one formula and label it.
-- **Other APIs fall short.** `psutil.sensors_battery()` and `pmset -g batt` only give %, whether it's plugged in, and time left. That isn't enough for wattage.
-- **Python on macOS.** Bare `python3` can resolve to Apple's Command Line Tools Python 3.9, which uses the deprecated Tk 8.5, and Homebrew Python has no tkinter unless `python-tk` is installed. For GUI work, use a modern interpreter or a venv built from one.
-- **GUI refresh.** Schedule refreshes with the GUI toolkit's timer instead of reusing the blocking `while True` + `time.sleep` loop, which would freeze the window.
-- **Serial numbers.** ioreg output includes battery and adapter serial numbers (`Serial`, `BatteryData.Serial`, `AdapterDetails.SerialString`). Read fields by name and never print, log or commit these, including in saved ioreg dumps or test fixtures.
-
-## GUI design (in progress)
-
-The design interview for the window version is paused while `Battery.py` moves into this repo. Next step: get the user's answers to the open questions, then ask the next-round items. Don't write GUI code until the user confirms the whole design. Replace this section with real docs once the GUI lands.
-
-### Settled
-
-- Python. Any library is fine, including installing packages.
-- The window only displays charging info: no alerts, no charging controls.
-- It starts by running the script (the exact command is a next-round item).
-- It has to look very clean.
-- **Q2:** it updates live while open. How often is Q9.
-- **Q6:** macOS on Apple Silicon only, since the data it reads only exists there.
-- **Q5** (how the main number is drawn) is withdrawn until Q7 is answered.
-
-### Open questions
-
-Each lists the recommended option. Answer by filling in **Answer:** or in chat.
-
-**Q1. Window type**
-- (a) Regular app window with the red/yellow/green buttons.
-- (b) Small widget with a title bar that stays on top of other windows.
-- (c) Small widget with no title bar: a rounded card that stays on top, drags from anywhere, and closes with a small ×.
-- Recommended: (c).
-- **Answer:**
-
-**Q3. Overall style**
-- (a) Native macOS: system font (SF Pro) and colors, frosted-glass background like Control Center.
-- (b) Custom modern: solid card, bold accent color, crisp flat shapes.
-- (c) Ultra-minimal: almost no color, lots of empty space, thin lines.
-- Recommended: (a).
-- **Answer:**
-
-**Q4. Light or dark**
-- (a) Always dark.
-- (b) Always light.
-- (c) Follow the macOS appearance setting (currently Auto on the author's Mac).
-- Recommended: (c).
-- **Answer:**
-
-**Q7. What's on screen**
-- (a) Just the script's three numbers: charger rating, power in, system load.
-- (b) Those three plus the charging basics: battery %, status (charging / on hold / on battery / full), power into or out of the battery, and time to full or empty when macOS provides it.
-- (c) Everything in (b) plus battery health: capacity compared with new, cycle count, temperature.
-- (d) Everything, including raw voltage and current.
-- Recommended: (b). The status can say why it isn't charging, e.g. "On hold at 80% · Optimized Battery Charging". `pmset -g battlimit` (undocumented) shows the limit and its reason.
-- **Answer:**
-
-**Q8. What happens to Battery.py**
-- (a) Add a new file next to it (e.g. `battery_window.py`) and leave `Battery.py` as is.
-- (b) `Battery.py` becomes the window app. Commit the terminal version first so git history keeps it.
-- (c) `Battery.py` does both: the window by default, the old terminal line with `--terminal`.
-- Recommended: (b).
-- **Answer:**
-
-**Q9. How live**
-- (a) Once a minute: standard ioreg data only. Simplest and least likely to break.
-- (b) Every second: watts from the SMC, everything else from ioreg. Falls back to once a minute automatically if the SMC can't be read.
-- Recommended: (b).
-- **Answer:**
-
-SMC facts for (b), verified read-only on an M4 Pro:
+**SMC** (read-only, verified on an M4 Pro, macOS 26):
 - Works without sudo: ctypes to IOKit's `AppleSMC` service, selector 2, 80-byte struct. Send only the read commands 5 (read key), 8 (key by index) and 9 (key info), never 6 (write).
-- Values tick once a second; polling faster gives nothing new.
-- `flt ` values are little-endian. Integers are little-endian when the key-info attribute has bit 0x04 set, big-endian otherwise.
-- Keys: `PDTR` charger power (W), `PSTR` system total power (W), `VD0R`/`ID0R` charger volts/amps, `B0AC` battery current (mA, signed; sign not yet verified), `BUIC` battery % as shown in the menu bar, `CHNC` bit 24 = charging stopped by the charge limit. `CHLT`'s first byte appears to be the limit (0x50 = 80%).
-- `PPBR` is not battery power (it's non-zero while the battery is idle), despite some apps labelling it that way.
+- Values tick once a second. `flt ` is little-endian; integers are little-endian when key-info attribute bit 0x04 is set.
+- `PDTR` = power at the charger port (≈ `VD0R` × `ID0R`). `PSTR` = system load. `PDTR − PSTR` is about 1.3 W even with the battery idle, so it isn't battery power.
+- Battery power = `B0AC` (mA, si16) × `B0AV` (mV, matches ioreg `Voltage`). The code assumes negative = discharging (like ioreg's `InstantAmperage`), but the sign is **unverified**: the battery sat idle at 80% the whole time. Check it once the Mac is charging or discharging.
+- `BUIC` = battery %. `CHLT`'s first byte looks like the limit (0x50 = 80%). `PPBR` is *not* battery power (it's non-zero with the battery idle).
 
-### Next round (after the answers)
+## PyObjC gotchas (verified on macOS 26, PyObjC 12)
 
-- **Q5 again:** which number is the headline, and how it's drawn (ring, bar or big number).
-- **GUI library.** Candidates: PySide6 (Qt), PyObjC (native AppKit, including the frosted-glass effect), pywebview (HTML/CSS in a native window), CustomTkinter.
-- **Interpreter, run command and dependencies.** `.venv/` is already gitignored. On the author's Mac: bare `python3` and VS Code's default interpreter are Apple's Python 3.9 (Tk 8.5); the Anaconda base Python 3.13 already has PySide6 6.9 and PyObjC 12.1; uv is installed; Homebrew's Python 3.14 has no tkinter.
-- **Window details:** size, position, Dock icon, how to quit.
-- **Status wording and colors.**
-- **README:** whether to add run instructions.
-- **Only if Q7 is (c) or (d):** which battery-health formula to show, and °C or °F.
+- **Ctrl+C.** `AppHelper.runEventLoop()` skips its SIGINT handler once `NSApp` exists, so call `AppHelper.installMachInterrupt()` first. `terminate:` bypasses `atexit`; cleanup belongs in `applicationWillTerminate_`.
+- **Activation.** `NSApp.activate()` doesn't bring the window forward when launched from a terminal; `activateIgnoringOtherApps_(True)` does.
+- **Vibrancy.** Inside the frosted view, the effective appearance is `VibrantLight`/`VibrantDark`. Label colors drawn by a custom view that doesn't allow vibrancy come out *inverted*, so custom drawing (like `Bar`) picks plain colors from the appearance name.
+- **Occlusion lag.** `windowDidChangeOcclusionState_` can arrive more than a second late, so close, minimize and reopen start and stop the timer directly.
+- Every helper method on an `NSObject` subclass needs `@objc.python_method`.
+
+## Checking changes
+
+- **Logic.** `describe()` is pure. Feed it made-up ioreg dicts plus `live` dicts (or `None` for the fallback), one for each status.
+- **Behavior.** Import `Battery` in a script, call `applicationDidFinishLaunching_`, pump the run loop, and check `d.timer` and `d.window.level()` around close, reopen, minimize and pin. Set `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__` lands in the repo. For a launch check, run `uv run Battery.py` in its own process group and SIGINT the group: expect exit 0 in about 0.2 s and no output. `CFLOG_FORCE_STDERR=1` surfaces NSLog and PyObjC exceptions (plus a lot of system noise).
+- **Looks.** `screencapture` needs Screen Recording permission, so capture in-process instead. Put your own backdrop window at level 1000 with the app window at 1001 above it, then grab that rect with Quartz `CGWindowListCreateImage(rect, kCGWindowListOptionOnScreenOnly, …)`; pyobjc-framework-Quartz goes in a scratch venv. `cacheDisplayInRect` and `CGWindowListCreateImageFromArray` both skip the blur, so use them only for layout.
