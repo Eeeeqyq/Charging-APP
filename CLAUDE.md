@@ -25,11 +25,19 @@ uv run Battery.py        # or: python3 Battery.py
 ## Design
 
 - **Window.** A titled, closable, miniaturizable window 300 pt wide, not resizable. Transparent title bar with full-size content and no title text. Frosted `NSVisualEffectView`: material `menu`, behind-window blending, always active. It follows light/dark on its own. The height fits the content and animates on plug/unplug, keeping the top edge in place. Every launch opens centered and unpinned (`restorable` off).
-- **Pin.** A pin icon at the bottom right toggles `NSFloatingWindowLevel`, on the current Space only. The pinned state isn't saved.
+- **Buttons.** Three SF Symbol icons at the bottom right, in this order:
+  - A chevron (⌄/⌃) opens and closes the details section.
+  - A pin toggles `NSFloatingWindowLevel` (current Space only).
+  - A power icon quits (`terminate:` via the responder chain).
+  Every launch starts collapsed and unpinned.
+- **Details** (expanded). A separator, then two titled groups:
+  - Charger: the adapter's name, and its live input as volts · amps. Shown only while plugged in; the input row is hidden on the ioreg fallback.
+  - Battery: voltage, signed current, temperature, "65 of 1,000" cycles, and maximum capacity.
+  Rows and groups with no value are hidden.
 - **Content.** The headline is power in ("62.4 W", "of 94 W charger", plus a bar showing the share of the charger's rating in use). On battery it's the power drawn from the battery ("from battery"), and the bar, "Into battery" and "System load" rows are hidden. Below that: the status line (colored dot, and a second quieter line when it doesn't fit), then rows for Battery %, Into battery and System load. The footer "Updated N s ago" appears only on the ioreg fallback. Watts have one decimal, the charger rating is a whole number, times read "1 h 12 min", digits are monospaced.
 - **Status** comes from ioreg flags, except that "plugged in" is decided live from `PDTR > 0.5 W`, so unplugging shows within a second. States: charging (green), on hold with a reason (orange), on battery (gray), fully charged (green), charger too weak (orange), a gray "Plugged in" for the moment before ioreg catches up with a plug, and a centered message when there's no battery or the data can't be read.
 - **Refresh.** An `NSTimer` ticks every 1 s in common modes. SMC every tick; ioreg every 5 s and right after a plug change; `pmset -g battlimit` at most once a minute while on hold. All reading stops while the window is closed, minimized, hidden or fully covered.
-- **Out of scope** (by agreement): alerts, charging controls, battery health, a Dock badge, a `.app` bundle.
+- **Out of scope** (by agreement): alerts, charging controls, a Dock badge, a `.app` bundle.
 
 ## Data sources
 
@@ -47,13 +55,18 @@ uv run Battery.py        # or: python3 Battery.py
 | `PowerTelemetryData.SystemPowerIn`, `.SystemLoad` | mW | Equal to each other while the battery is idle. |
 | `PowerTelemetryData.BatteryPower` | mW, signed | Negative = discharging. |
 | `ChargerData.NotChargingReason` | bits | Bit 24 = held by the charge limit (same as SMC `CHNC` bit 24). |
-| `Voltage`, `InstantAmperage` | mV, mA signed | |
+| `Voltage`, `InstantAmperage` | mV, mA signed | Fallback for the details' voltage and current. |
+| `Temperature` | 0.01 °C | Shown through `NSMeasurementFormatter`, which follows the °C/°F setting in Language & Region. |
+| `CycleCount`, `DesignCycleCount9C` | cycles | The rated count is 1000. |
+| `BatteryData.MaxCapacity` | % | Used as "Maximum capacity". It matched System Information (100%), while the raw ratios gave 96% (`AppleRawMaxCapacity`/`DesignCapacity`) and 98% (`NominalChargeCapacity`/`DesignCapacity`). Not yet cross-checked below 100%. |
+| `AdapterDetails.Name` | text | "96W USB-C Power Adapter". |
 
 **pmset.** `pmset -g battlimit` (undocumented) prints `chargeSocLimitReason = optimizedBatteryCharging;` and `chargeSocLimitSoc = 80;`. Any other reason string is shown as "Charge limit".
 
 **SMC** (read-only, verified on an M4 Pro, macOS 26):
 - Works without sudo: ctypes to IOKit's `AppleSMC` service, selector 2, 80-byte struct. Send only the read commands 5 (read key), 8 (key by index) and 9 (key info), never 6 (write).
 - Values tick once a second. `flt ` is little-endian; integers are little-endian when key-info attribute bit 0x04 is set.
+- `VD0R`/`ID0R` = charger input volts and amps (details only). If they fail to read, just those rows go blank; the live watts keep working.
 - `PDTR` = power at the charger port (≈ `VD0R` × `ID0R`). `PSTR` = system load. `PDTR − PSTR` is about 1.3 W even with the battery idle, so it isn't battery power.
 - Battery power = `B0AC` (mA, si16) × `B0AV` (mV, matches ioreg `Voltage`). The code assumes negative = discharging (like ioreg's `InstantAmperage`), but the sign is **unverified**: the battery sat idle at 80% the whole time. Check it once the Mac is charging or discharging.
 - `BUIC` = battery %. `CHLT`'s first byte looks like the limit (0x50 = 80%). `PPBR` is *not* battery power (it's non-zero with the battery idle).
@@ -64,10 +77,11 @@ uv run Battery.py        # or: python3 Battery.py
 - **Activation.** `NSApp.activate()` doesn't bring the window forward when launched from a terminal; `activateIgnoringOtherApps_(True)` does.
 - **Vibrancy.** Inside the frosted view, the effective appearance is `VibrantLight`/`VibrantDark`. Label colors drawn by a custom view that doesn't allow vibrancy come out *inverted*, so custom drawing (like `Bar`) picks plain colors from the appearance name.
 - **Occlusion lag.** `windowDidChangeOcclusionState_` can arrive more than a second late, so close, minimize and reopen start and stop the timer directly.
+- **Stack stretching.** An `NSStackView` nested in an equal-spacing stack gets stretched, which spreads its children apart, so raise its hugging priority (`setHuggingPriority_forOrientation_`).
 - Every helper method on an `NSObject` subclass needs `@objc.python_method`.
 
 ## Checking changes
 
-- **Logic.** `describe()` is pure. Feed it made-up ioreg dicts plus `live` dicts (or `None` for the fallback), one for each status.
+- **Logic.** `describe()` is pure. Feed it made-up ioreg dicts plus `live` dicts (or `None` for the fallback), one for each status. `live` dicts carry `in`, `load`, `battery`, `battery_v`, `battery_a` and `charger` (a volts, amps pair, or `None`).
 - **Behavior.** Import `Battery` in a script, call `applicationDidFinishLaunching_`, pump the run loop, and check `d.timer` and `d.window.level()` around close, reopen, minimize and pin. Set `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__` lands in the repo. For a launch check, run `uv run Battery.py` in its own process group and SIGINT the group: expect exit 0 in about 0.2 s and no output. `CFLOG_FORCE_STDERR=1` surfaces NSLog and PyObjC exceptions (plus a lot of system noise).
 - **Looks.** `screencapture` needs Screen Recording permission, so capture in-process instead. Put your own backdrop window at level 1000 with the app window at 1001 above it, then grab that rect with Quartz `CGWindowListCreateImage(rect, kCGWindowListOptionOnScreenOnly, …)`; pyobjc-framework-Quartz goes in a scratch venv. `cacheDisplayInRect` and `CGWindowListCreateImageFromArray` both skip the blur, so use them only for layout.

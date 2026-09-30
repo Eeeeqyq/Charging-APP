@@ -22,20 +22,23 @@ try:
     import objc
     from AppKit import (
         NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSAttributedString, NSBackingStoreBuffered,
-        NSBaselineOffsetAttributeName, NSBezierPath, NSButton, NSButtonTypeToggle, NSColor, NSControlStateValueOn,
-        NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSFontWeightMedium, NSFontWeightRegular,
-        NSFontWeightSemibold, NSForegroundColorAttributeName, NSGradient, NSImage, NSImageOnly,
-        NSImageSymbolConfiguration, NSLayoutAttributeLeading, NSLineBreakByTruncatingTail, NSMenu, NSMenuItem,
-        NSMutableAttributedString, NSMutableParagraphStyle, NSNormalWindowLevel, NSParagraphStyleAttributeName,
-        NSStackView,
-        NSStackViewDistributionEqualSpacing, NSTextAlignmentCenter, NSTextField, NSTitlebarSeparatorStyleNone,
-        NSUserInterfaceLayoutOrientationVertical, NSView, NSViewNoIntrinsicMetric,
-        NSVisualEffectBlendingModeBehindWindow, NSVisualEffectMaterialMenu, NSVisualEffectStateActive,
-        NSVisualEffectView, NSWindow, NSWindowOcclusionStateVisible, NSWindowStyleMaskClosable,
-        NSWindowStyleMaskFullSizeContentView, NSWindowStyleMaskMiniaturizable, NSWindowStyleMaskTitled,
-        NSWindowTitleHidden,
+        NSBaselineOffsetAttributeName, NSBezierPath, NSBox, NSBoxSeparator, NSButton, NSButtonTypeToggle, NSColor,
+        NSControlStateValueOn, NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSFontWeightMedium,
+        NSFontWeightRegular, NSFontWeightSemibold, NSForegroundColorAttributeName, NSGradient, NSImage,
+        NSImageOnly, NSImageSymbolConfiguration, NSLayoutAttributeLeading, NSLayoutConstraintOrientationHorizontal,
+        NSLayoutPriorityDefaultHigh, NSLineBreakByTruncatingTail, NSMenu,
+        NSMenuItem, NSMutableAttributedString, NSMutableParagraphStyle, NSNormalWindowLevel,
+        NSParagraphStyleAttributeName, NSStackView, NSStackViewDistributionEqualSpacing, NSTextAlignmentCenter,
+        NSTextField, NSTitlebarSeparatorStyleNone, NSUserInterfaceLayoutOrientationVertical, NSView,
+        NSViewNoIntrinsicMetric, NSVisualEffectBlendingModeBehindWindow, NSVisualEffectMaterialMenu,
+        NSVisualEffectStateActive, NSVisualEffectView, NSWindow, NSWindowOcclusionStateVisible,
+        NSWindowStyleMaskClosable, NSWindowStyleMaskFullSizeContentView, NSWindowStyleMaskMiniaturizable,
+        NSWindowStyleMaskTitled, NSWindowTitleHidden,
     )
-    from Foundation import NSBundle, NSMakeRect, NSMakeSize, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+    from Foundation import (
+        NSBundle, NSMakeRect, NSMakeSize, NSMeasurement, NSMeasurementFormatter, NSObject, NSRunLoop,
+        NSRunLoopCommonModes, NSTimer, NSUnitTemperature,
+    )
     from PyObjCTools import AppHelper
 except ImportError as error:
     # No PyObjC here (e.g. Apple's python3): relaunch through uv, which installs
@@ -50,6 +53,11 @@ PAD, TOP, BOTTOM = 20, 40, 14    # content insets; TOP clears the traffic lights
 IOREG_EVERY = 5                  # seconds between ioreg reads; macOS refreshes them about once a minute
 NOT_AVAILABLE = 65535            # ioreg's "no estimate" for times
 CHARGE_LIMIT_HOLD = 1 << 24      # ChargerData.NotChargingReason bit: held by the charge limit
+
+# The expandable details section: (section title, [(key in describe()["details"], row title)]).
+DETAILS = [("Charger", [("adapter", "Adapter"), ("input", "Input")]),
+           ("Battery", [("voltage", "Voltage"), ("current", "Current"), ("temperature", "Temperature"),
+                        ("cycles", "Cycle count"), ("capacity", "Maximum capacity")])]
 
 
 # --- SMC: live watts, ticking once a second ---------------------------------
@@ -121,10 +129,17 @@ class SMC:
             return int.from_bytes(raw, "little" if attributes & 0x04 else "big", signed=kind[:2] == "si")
         raise OSError(f"SMC {key}: unsupported type {kind!r}")
 
-    def power(self):
-        """Watts: from the charger, used by the system, into the battery (negative = out of it)."""
-        return {"in": self.read("PDTR"), "load": self.read("PSTR"),
-                "battery": self.read("B0AC") * self.read("B0AV") / 1e6}
+    def live(self):
+        """Watts from the charger, used by the system and into the battery (negative = out of it),
+        plus the volts and amps behind them."""
+        battery_ma, battery_mv = self.read("B0AC"), self.read("B0AV")
+        readings = {"in": self.read("PDTR"), "load": self.read("PSTR"), "battery": battery_ma * battery_mv / 1e6,
+                    "battery_v": battery_mv / 1000, "battery_a": battery_ma / 1000}
+        try:
+            readings["charger"] = (self.read("VD0R"), self.read("ID0R"))
+        except OSError:
+            readings["charger"] = None  # only feeds the details section; keep the live watts regardless
+        return readings
 
 
 # --- ioreg and pmset: everything else ----------------------------------------
@@ -149,6 +164,10 @@ def charge_limit_reason():
 
 # --- What the window says ------------------------------------------------------
 
+TEMPERATURE = NSMeasurementFormatter.alloc().init()  # °C or °F, as set in Language & Region
+TEMPERATURE.numberFormatter().setMaximumFractionDigits_(1)
+
+
 def minutes(battery, *keys):
     for key in keys:
         value = battery.get(key)
@@ -164,11 +183,11 @@ def duration(total):
     return f"{hours} h {mins} min" if mins else f"{hours} h"
 
 
-def signed_watts(watts):
-    text = f"{abs(watts):.1f} W"
-    if text == "0.0 W":
+def signed(value, unit, digits=1):
+    text = f"{abs(value):.{digits}f} {unit}"
+    if not round(value, digits):
         return text
-    return ("+" if watts > 0 else "−") + text
+    return ("+" if value > 0 else "−") + text
 
 
 def updated_ago(seconds):
@@ -177,19 +196,22 @@ def updated_ago(seconds):
 
 
 def describe(battery, live, now, hold_reason=None):
-    """What to show, from the ioreg entry plus live SMC watts (None when falling back to ioreg only)."""
+    """What to show, from the ioreg entry plus live SMC readings (None when falling back to ioreg only)."""
     telemetry = battery.get("PowerTelemetryData", {})
     reported_plugged = bool(battery.get("ExternalConnected"))
     if live:
         power_in, load, into_battery = live["in"], live["load"], live["battery"]
+        volts, amps = live["battery_v"], live["battery_a"]
         plugged = power_in > 0.5  # live, so unplugging shows up within a second
     else:
         power_in = telemetry.get("SystemPowerIn", 0) / 1000
         load = telemetry.get("SystemLoad", 0) / 1000
         into_battery = telemetry.get("BatteryPower", 0) / 1000
+        volts, amps = battery.get("Voltage", 0) / 1000, battery.get("InstantAmperage", 0) / 1000
         plugged = reported_plugged
     percent = battery.get("CurrentCapacity", 0)
-    charger = battery.get("AdapterDetails", {}).get("Watts") if plugged else None
+    adapter = battery.get("AdapterDetails", {}) if plugged else {}
+    charger = adapter.get("Watts")
 
     if not plugged:
         left = None if reported_plugged else minutes(battery, "AvgTimeToEmpty", "TimeRemaining")
@@ -208,6 +230,21 @@ def describe(battery, live, now, hold_reason=None):
         status = f"On hold at {percent}%" + (f" · {hold_reason or 'Charge limit'}" if held else "")
         color = "orange"
 
+    charger_input = live.get("charger") if live and plugged else None
+    cycles, rated = battery.get("CycleCount"), battery.get("DesignCycleCount9C")
+    capacity = battery.get("BatteryData", {}).get("MaxCapacity")  # matches System Information's "Maximum Capacity"
+    celsius = battery.get("Temperature")  # hundredths of a degree
+    details = {
+        "adapter": adapter.get("Name"),
+        "input": f"{charger_input[0]:.1f} V · {charger_input[1]:.2f} A" if charger_input else None,
+        "voltage": f"{volts:.2f} V",
+        "current": signed(amps, "A", 2),
+        "temperature": TEMPERATURE.stringFromMeasurement_(NSMeasurement.alloc().initWithDoubleValue_unit_(
+            celsius / 100, NSUnitTemperature.celsius())) if isinstance(celsius, int) else None,
+        "cycles": (f"{cycles:,} of {rated:,}" if rated else f"{cycles:,}") if isinstance(cycles, int) else None,
+        "capacity": f"{capacity}%" if isinstance(capacity, int) else None,
+    }
+
     return {
         "headline": power_in if plugged else abs(into_battery),
         "subtitle": (f"of {charger} W charger" if charger else "from charger") if plugged else "from battery",
@@ -215,9 +252,10 @@ def describe(battery, live, now, hold_reason=None):
         "status": status,
         "color": color,
         "battery": f"{percent}%",
-        "into_battery": signed_watts(into_battery) if plugged else None,
+        "into_battery": signed(into_battery, "W") if plugged else None,
         "load": f"{load:.1f} W" if plugged else None,
         "footer": "" if live else updated_ago(now - battery.get("UpdateTime", now)),
+        "details": details,
     }
 
 
@@ -249,13 +287,13 @@ def status_lines(text, color):
     line = joined(dot, styled(text, 13, NSFontWeightMedium, NSColor.labelColor()))
     if line.size().width <= WIDTH - 2 * PAD or " · " not in text:
         return line, None
-    head, detail = text.split(" · ", 1)
+    head, note = text.split(" · ", 1)
     indent = NSMutableParagraphStyle.alloc().init()
     indent.setFirstLineHeadIndent_(dot.size().width)
-    detail = NSAttributedString.alloc().initWithString_attributes_(detail, {
+    note = NSAttributedString.alloc().initWithString_attributes_(note, {
         NSFontAttributeName: NSFont.monospacedDigitSystemFontOfSize_weight_(12, NSFontWeightRegular),
         NSForegroundColorAttributeName: NSColor.secondaryLabelColor(), NSParagraphStyleAttributeName: indent})
-    return joined(dot, styled(head, 13, NSFontWeightMedium, NSColor.labelColor())), detail
+    return joined(dot, styled(head, 13, NSFontWeightMedium, NSColor.labelColor())), note
 
 
 def label(size, weight=NSFontWeightRegular, color=None):
@@ -278,10 +316,34 @@ def stack(views, vertical=False, spacing=8):
     return view
 
 
-def pin_image(name):
+def row(title, size):
+    """A title on the left and its value on the right. Returns (row, value field)."""
+    name = label(size, color=NSColor.secondaryLabelColor())
+    name.setStringValue_(title)
+    value = label(size, NSFontWeightMedium)
+    return stack([name, value]), value
+
+
+def icon(name, description):
     config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(12, NSFontWeightMedium)
-    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "Keep on top")
+    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, description)
     return image.imageWithSymbolConfiguration_(config)
+
+
+def icon_button(symbol, tooltip, target, action, toggled=None):
+    """A borderless SF Symbol button. With `toggled`, an on/off switch that shows that symbol when on."""
+    button = NSButton.alloc().init()
+    button.setBordered_(False)
+    button.setImagePosition_(NSImageOnly)
+    button.setImage_(icon(symbol, tooltip))
+    if toggled:
+        button.setButtonType_(NSButtonTypeToggle)
+        button.setAlternateImage_(icon(toggled, tooltip))
+    button.setContentTintColor_(NSColor.secondaryLabelColor())
+    button.setToolTip_(tooltip)
+    button.setTarget_(target)
+    button.setAction_(action)
+    return button
 
 
 def app_icon():
@@ -334,7 +396,7 @@ class App(NSObject):
     """App delegate, window delegate and refresh-timer target."""
 
     def applicationDidFinishLaunching_(self, notification):
-        self.timer = None
+        self.timer, self.expanded = None, False
         self.battery, self.error, self.read_at, self.plugged = None, None, 0.0, None
         self.reason, self.reason_at = None, 0.0
         try:
@@ -383,6 +445,11 @@ class App(NSObject):
         self.window.setLevel_(NSFloatingWindowLevel if pinned else NSNormalWindowLevel)
         sender.setContentTintColor_(NSColor.controlAccentColor() if pinned else NSColor.secondaryLabelColor())
 
+    def toggleDetails_(self, sender):
+        self.expanded = sender.state() == NSControlStateValueOn
+        sender.setToolTip_("Hide details" if self.expanded else "Show details")
+        self.refresh()  # shows or hides the section and animates the height
+
     @objc.python_method
     def start(self, animate=True):
         if self.timer is None:
@@ -405,7 +472,7 @@ class App(NSObject):
         live = None
         if self.smc is not None:
             try:
-                live = self.smc.power()
+                live = self.smc.live()
             except OSError:
                 pass
         plugged = live["in"] > 0.5 if live else None
@@ -450,21 +517,30 @@ class App(NSObject):
         if view["bar"] is not None:
             self.bar.fraction, self.bar.color = view["bar"], color
             self.bar.setNeedsDisplay_(True)
-        line, detail = status_lines(view["status"], color)
+        line, note = status_lines(view["status"], color)
         self.status.setAttributedStringValue_(line)
-        self.detail.setHidden_(detail is None)
-        if detail is not None:
-            self.detail.setAttributedStringValue_(detail)
+        self.status_note.setHidden_(note is None)
+        if note is not None:
+            self.status_note.setAttributedStringValue_(note)
         self.values["battery"].setStringValue_(view["battery"])
-        for key, row in self.rows.items():
-            row.setHidden_(view[key] is None)
+        for key, row_view in self.rows.items():
+            row_view.setHidden_(view[key] is None)
             if view[key] is not None:
                 self.values[key].setStringValue_(view[key])
         self.footer.setStringValue_(view["footer"])
 
+        self.details.setHidden_(not self.expanded)
+        for title, fields in DETAILS:
+            values = [view["details"][key] for key, _ in fields]
+            self.sections[title].setHidden_(all(value is None for value in values))
+            for (key, _), value in zip(fields, values):
+                self.detail_rows[key].setHidden_(value is None)
+                if value is not None:
+                    self.detail_values[key].setStringValue_(value)
+
     @objc.python_method
     def show_message(self, text):
-        for part in self.parts:
+        for part in self.parts + [self.details]:
             part.setHidden_(True)
         self.message.setStringValue_(text)
         self.message.setHidden_(False)
@@ -507,7 +583,7 @@ class App(NSObject):
         window.setTitlebarSeparatorStyle_(NSTitlebarSeparatorStyleNone)
         window.setMovableByWindowBackground_(True)
         window.setReleasedWhenClosed_(False)
-        window.setRestorable_(False)  # every launch starts centered and unpinned
+        window.setRestorable_(False)  # every launch starts centered, unpinned and collapsed
         window.setDelegate_(self)
         glass = NSVisualEffectView.alloc().init()
         glass.setMaterial_(NSVisualEffectMaterialMenu)
@@ -521,39 +597,46 @@ class App(NSObject):
         self.subtitle = label(13, color=NSColor.secondaryLabelColor())
         self.bar = Bar.alloc().init()
         self.status = label(13)
-        self.detail = label(12, color=NSColor.secondaryLabelColor())
+        self.status_note = label(12, color=NSColor.secondaryLabelColor())
         self.values, rows = {}, {}
         for key, title in (("battery", "Battery"), ("into_battery", "Into battery"), ("load", "System load")):
-            name = label(13, color=NSColor.secondaryLabelColor())
-            name.setStringValue_(title)
-            self.values[key] = label(13, NSFontWeightMedium)
-            rows[key] = stack([name, self.values[key]])
+            rows[key], self.values[key] = row(title, 13)
         self.rows = {key: rows[key] for key in ("into_battery", "load")}  # hidden on battery
-        self.footer = label(11, color=NSColor.tertiaryLabelColor())
-        pin = NSButton.alloc().init()
-        pin.setButtonType_(NSButtonTypeToggle)
-        pin.setBordered_(False)
-        pin.setImagePosition_(NSImageOnly)
-        pin.setImage_(pin_image("pin"))
-        pin.setAlternateImage_(pin_image("pin.fill"))
-        pin.setContentTintColor_(NSColor.secondaryLabelColor())
-        pin.setToolTip_("Keep on top")
-        pin.setTarget_(self)
-        pin.setAction_("togglePin:")
 
-        status = stack([self.status, self.detail], vertical=True, spacing=2)
+        line = NSBox.alloc().init()
+        line.setBoxType_(NSBoxSeparator)
+        self.detail_rows, self.detail_values, self.sections = {}, {}, {}
+        for title, fields in DETAILS:
+            header = label(11, NSFontWeightSemibold, NSColor.secondaryLabelColor())
+            header.setStringValue_(title)
+            for key, name in fields:
+                self.detail_rows[key], self.detail_values[key] = row(name, 12)
+            self.sections[title] = stack([header] + [self.detail_rows[key] for key, _ in fields],
+                                         vertical=True, spacing=4)
+        self.details = stack([line] + list(self.sections.values()), vertical=True, spacing=10)
+
+        self.footer = label(11, color=NSColor.tertiaryLabelColor())
+        buttons = stack([icon_button("chevron.down", "Show details", self, "toggleDetails:", toggled="chevron.up"),
+                         icon_button("pin", "Keep on top", self, "togglePin:", toggled="pin.fill"),
+                         icon_button("power", "Quit Charging", None, "terminate:")], spacing=12)
+        buttons.setHuggingPriority_forOrientation_(NSLayoutPriorityDefaultHigh, NSLayoutConstraintOrientationHorizontal)
+        bottom = stack([self.footer, buttons])
+
+        status = stack([self.status, self.status_note], vertical=True, spacing=2)
         table = stack(list(rows.values()), vertical=True, spacing=6)
-        bottom = stack([self.footer, pin])
         self.parts = [self.headline, self.subtitle, self.bar, status, table, bottom]
-        self.content = stack([self.message] + self.parts, vertical=True, spacing=0)
+        self.content = stack([self.message] + self.parts[:-1] + [self.details, bottom], vertical=True, spacing=0)
         self.content.setTranslatesAutoresizingMaskIntoConstraints_(False)
-        for view, space in ((self.message, 0), (self.subtitle, 12), (self.bar, 16), (status, 16), (table, 12)):
+        for view, space in ((self.message, 0), (self.subtitle, 12), (self.bar, 16), (status, 16), (table, 12),
+                            (self.details, 12)):
             self.content.setCustomSpacing_afterView_(space, view)
         glass.addSubview_(self.content)
         self.content.leadingAnchor().constraintEqualToAnchor_constant_(glass.leadingAnchor(), PAD).setActive_(True)
         self.content.trailingAnchor().constraintEqualToAnchor_constant_(glass.trailingAnchor(), -PAD).setActive_(True)
         self.content.topAnchor().constraintEqualToAnchor_constant_(glass.topAnchor(), TOP).setActive_(True)
-        for view in (self.message, self.bar, status, self.status, self.detail, table, bottom) + tuple(rows.values()):
+        full_width = [self.message, self.bar, status, self.status, self.status_note, table, bottom, self.details, line]
+        full_width += list(rows.values()) + list(self.sections.values()) + list(self.detail_rows.values())
+        for view in full_width:
             view.widthAnchor().constraintEqualToAnchor_(self.content.widthAnchor()).setActive_(True)
         self.window = window
 
